@@ -121,6 +121,18 @@ label.chk{display:flex;gap:6px;align-items:center;font-size:14px}
 .tick[aria-pressed="true"]{background:#1f8a4c;border-color:#1f8a4c;color:#fff}
 .stops li.done b,.stops li.done small{opacity:.5;text-decoration:line-through}
 .num-marker.done{background:#8a96a3}
+.scanrow{display:flex;gap:8px}
+.btn.scan{flex:1;background:#ff9900;color:#111;padding:13px 14px;font-size:16px}
+#scanBox{border:1.5px dashed var(--line);border-radius:8px;padding:10px;font-size:14px}
+#scanBox:empty{display:none}
+.pcchips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.pcchip{border:2px solid var(--sign);background:var(--panel);color:var(--ink);border-radius:8px;padding:7px 11px;font:800 16px var(--road);cursor:pointer;text-align:left}
+.pcchip small{display:block;font:400 12px var(--ui);color:var(--muted)}
+.pcchip.out{border-style:dashed;border-color:var(--muted)}
+.pcchip[disabled]{opacity:.45}
+.okmsg{color:#1f8a4c;font-weight:700}
+.scanacts{display:flex;gap:8px;margin-top:9px}
+.scanacts .btn{padding:10px 12px}
 .mapbar button.hot{background:#ff9900;color:#111}
 :root[data-theme="dark"] .mapbar button:not(.hot):not([aria-pressed="true"]),:root[data-theme="dark"] .legend{background:#1e2a37;color:#e8eef4}
 :root[data-theme="dark"] .card{background:#16212d;color:#e8eef4}
@@ -197,6 +209,11 @@ label.chk{display:flex;gap:6px;align-items:center;font-size:14px}
     </section>
     <section class="pane" id="pMulti">
       <div class="tools">
+        <div class="scanrow">
+          <button class="btn scan" id="bscan">📷 Scan parcel label</button>
+          <input type="file" id="scanFile" accept="image/*" capture="environment" hidden>
+        </div>
+        <div id="scanBox" aria-live="polite"></div>
         <textarea id="stopsIn" placeholder="One postcode per line (full or district)&#10;WS11 1DB&#10;B77 2HJ&#10;WS13"></textarea>
         <div class="chips">
           <select id="startSel" aria-label="Start point" style="margin-left:0"><option value="depot">Start at VAP4 depot</option><option value="gps">Start at my location</option></select>
@@ -211,7 +228,7 @@ label.chk{display:flex;gap:6px;align-items:center;font-size:14px}
       <div id="nextStop"></div>
       <ol class="stops" id="stopsOut"></ol>
       <div class="tot" id="tot"></div>
-      <div class="note">Stop order is optimised by OSRM’s trip planner from your start point. Up to 20 stops. Tap ✓ when a stop is delivered – your stops stay saved on this phone. District codes (e.g. WS13) route to the district centre; use full postcodes for real drops.</div>
+      <div class="note">Stop order is optimised by OSRM’s trip planner from your start point. Up to 20 stops. Tap ✓ when a stop is delivered – your stops stay saved on this phone. Label scans are read on your phone: the photo isn’t uploaded or kept, only the postcode is looked up. District codes (e.g. WS13) route to the district centre; use full postcodes for real drops.</div>
     </section>
   </aside>
 </main>
@@ -618,6 +635,119 @@ $("#bplan").onclick = async () => {
     if (isPhone()) setSheet("half");
     fitCoords(trip.geometry.coordinates);
   } catch (e) { msg.innerHTML = `<span class="err">Route not calculated – the routing server didn’t respond. Try again in a moment.</span>`; }
+};
+
+/* ---------- scan parcel label: OCR on the phone, postcode checked with postcodes.io ---------- */
+const TESS = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+let ocrWorker = null;
+const loadScript = src => new Promise((res, rej) => { const el = document.createElement("script"); el.src = src; el.onload = res; el.onerror = rej; document.head.appendChild(el); });
+async function getWorker() {
+  if (ocrWorker) return ocrWorker;
+  if (!window.Tesseract) await loadScript(TESS);
+  const w = await Tesseract.createWorker("eng", 1, {errorHandler: () => {}});
+  await w.setParameters({tessedit_pageseg_mode: "11"});
+  return ocrWorker = w;
+}
+const loadImg = file => new Promise((res, rej) => { const u = URL.createObjectURL(file), im = new Image();
+  im.onload = () => { URL.revokeObjectURL(u); res(im); }; im.onerror = rej; im.src = u; });
+function labelCanvas(img, rot) {
+  const k = Math.min(1, 1800 / Math.max(img.naturalWidth, img.naturalHeight));
+  const w = Math.round(img.naturalWidth * k), h = Math.round(img.naturalHeight * k), swap = rot % 180 !== 0;
+  const c = document.createElement("canvas"); c.width = swap ? h : w; c.height = swap ? w : h;
+  const x = c.getContext("2d", {willReadFrequently: true});
+  x.translate(c.width / 2, c.height / 2); x.rotate(rot * Math.PI / 180); x.drawImage(img, -w / 2, -h / 2, w, h);
+  const d = x.getImageData(0, 0, c.width, c.height), p = d.data;
+  for (let i = 0; i < p.length; i += 4) { const g = Math.max(0, Math.min(255, (0.299 * p[i] + 0.587 * p[i + 1] + 0.114 * p[i + 2] - 128) * 1.6 + 128)); p[i] = p[i + 1] = p[i + 2] = g; }
+  x.putImageData(d, 0, 0); return c;
+}
+/*PC-START*/
+// Turn OCR text into likely UK postcodes, fixing common misreads (0/O, 1/I, 5/S, 8/B) by position.
+function postcodeCandidates(text) {
+  const L = {"0": "O", "1": "I", "5": "S", "8": "B", "2": "Z", "6": "G"};
+  const D = {"O": "0", "D": "0", "Q": "0", "U": "0", "I": "1", "L": "1", "S": "5", "B": "8", "Z": "2", "G": "6", "T": "7"};
+  const toL = ch => L[ch] || ch, toD = ch => D[ch] || ch;
+  const toks = text.toUpperCase().replace(/[)\]}]/g, "J").replace(/[|!]/g, "I").replace(/\$/g, "S").replace(/[€£]/g, "E")
+    .replace(/[^A-Z0-9]+/g, " ").trim().split(" ").filter(Boolean);
+  const raw = [];
+  toks.forEach((t, i) => {
+    if (t.length >= 2 && t.length <= 4 && toks[i + 1] && toks[i + 1].length === 3) raw.push([t, toks[i + 1]]);
+    if (t.length >= 5 && t.length <= 7) raw.push([t.slice(0, -3), t.slice(-3)]);
+  });
+  const out = new Map();
+  raw.forEach(([o, n]) => {
+    const inward = toD(n[0]) + toL(n[1]) + toL(n[2]);
+    if (!/^\d[A-Z]{2}$/.test(inward)) return;
+    [1, 2].forEach(al => {
+      if (o.length < al + 1) return;
+      const area = [...o.slice(0, al)].map(toL).join("");
+      const rest = o.slice(al), dist = toD(rest[0]) + (rest[1] || "");
+      const outward = area + dist;
+      if (!/^[A-Z]{1,2}\d[A-Z\d]?$/.test(outward) || outward.length > 4) return;
+      const pc = outward + " " + inward;
+      const exact = o + " " + n === pc;
+      if (!out.has(pc) || exact) out.set(pc, {pc, exact});
+    });
+  });
+  return [...out.values()];
+}
+/*PC-END*/
+const AREAS = new Set(["B8", "B24", "B36", "B46", "B72", "B73", "B74", "B76", "B77", "B78"]);
+const inCoverage = pc => { const o = pc.split(" ")[0], a = o.match(/^[A-Z]+/)[0]; return ["WV", "DY", "WS"].includes(a) || AREAS.has(o); };
+async function checkPostcodes(cands) {
+  const list = cands.map(c => c.pc).filter(pc => pc !== "B76 9AA").slice(0, 100);
+  if (!list.length) return [];
+  const r = await fetch(`${PCIO}/postcodes`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({postcodes: list})});
+  if (!r.ok) throw new Error(r.status);
+  const seen = new Set();
+  return (await r.json()).result.filter(x => x.result && !seen.has(x.result.postcode) && seen.add(x.result.postcode))
+    .map(x => ({pc: x.result.postcode, town: TOWN[x.result.outcode] || x.result.admin_district || "", inArea: inCoverage(x.result.postcode)}))
+    .sort((a, b) => b.inArea - a.inArea);
+}
+const nStops = () => { const n = stopsList().length; return n + (n === 1 ? " stop" : " stops"); };
+function stopsList() { return $("#stopsIn").value.split(/[\n,;]+/).map(s => s.trim().toUpperCase()).filter(Boolean); }
+function addStop(pc) {
+  const have = stopsList().map(s => s.replace(/\s+/g, ""));
+  if (have.includes(pc.replace(/\s+/g, ""))) return false;
+  const v = $("#stopsIn").value.replace(/\s+$/, "");
+  $("#stopsIn").value = (v ? v + "\n" : "") + pc; store.set("vap4.stops", $("#stopsIn").value); return true;
+}
+const scanActs = () => `<div class="scanacts"><button class="btn scan" data-act="again">📷 Scan next</button><button class="btn ghost" data-act="close">Done</button></div>`;
+function showScan(found) {
+  const box = $("#scanBox"), n = stopsList().length;
+  if (!found.length) { box.innerHTML = `<span class="err">No postcode found on that photo.</span> Get closer so the address fills the picture, keep it flat and in good light – or type it below.${scanActs()}`; return; }
+  const inA = found.filter(f => f.inArea);
+  if (found.length === 1 && inA.length === 1) {
+    const f = found[0], added = addStop(f.pc);
+    box.innerHTML = `<span class="okmsg">${added ? "Added" : "Already in your list:"} ${esc(f.pc)}</span> ${esc(f.town)} <span style="color:var(--muted)">· ${nStops()}</span>${scanActs()}`; return;
+  }
+  box.innerHTML = `Tap the delivery postcode to add it:<div class="pcchips">${found.map(f => `<button class="pcchip${f.inArea ? "" : " out"}" data-pc="${esc(f.pc)}">${esc(f.pc)}<small>${esc(f.town)}${f.inArea ? "" : " – outside your areas"}</small></button>`).join("")}</div>${scanActs()}`;
+}
+$("#bscan").onclick = () => $("#scanFile").click();
+$("#scanBox").addEventListener("click", e => {
+  const chip = e.target.closest(".pcchip"), act = e.target.closest("[data-act]");
+  if (chip) { const added = addStop(chip.dataset.pc); chip.disabled = true;
+    chip.insertAdjacentHTML("afterend", `<span class="okmsg" style="align-self:center">${added ? "Added" : "Already in list"} · ${nStops()}</span>`); }
+  if (act && act.dataset.act === "again") $("#scanFile").click();
+  if (act && act.dataset.act === "close") $("#scanBox").innerHTML = "";
+});
+$("#scanFile").onchange = async e => {
+  const file = e.target.files[0]; e.target.value = ""; if (!file) return;
+  const box = $("#scanBox");
+  box.textContent = ocrWorker ? "Reading label…" : "Getting the label reader ready – the first scan takes a little longer…";
+  try {
+    const ready = getWorker().catch(err => { ocrWorker = null; throw err; });
+    const [w, img] = await Promise.all([Promise.race([ready, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 60000))]), loadImg(file)]);
+    let found = [];
+    for (const rot of [0, 90, 270]) {
+      box.textContent = rot ? "Trying the label turned sideways…" : "Reading label…";
+      const {data} = await w.recognize(labelCanvas(img, rot));
+      const c = postcodeCandidates(data.text);
+      if (c.length) { found = await checkPostcodes(c); if (found.length) break; }
+    }
+    showScan(found);
+  } catch (err) {
+    box.innerHTML = `<span class="err">Couldn’t read the label – check you’re online and try again.</span>${scanActs()}`;
+  }
 };
 
 /* multi-stop shortcut */
