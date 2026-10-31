@@ -131,6 +131,9 @@ label.chk{display:flex;gap:6px;align-items:center;font-size:14px}
 .pcchip.out{border-style:dashed;border-color:var(--muted)}
 .pcchip[disabled]{opacity:.45}
 .okmsg{color:#1f8a4c;font-weight:700}
+.codeinfo{margin-top:9px;font-size:12px;color:var(--muted)}
+.codeinfo summary{cursor:pointer}
+.codeinfo code{display:block;margin-top:4px;padding:6px;background:var(--bg);border-radius:6px;word-break:break-all;white-space:pre-wrap;font-size:11px;color:var(--ink)}
 .scanacts{display:flex;gap:8px;margin-top:9px}
 .scanacts .btn{padding:10px 12px}
 .mapbar button.hot{background:#ff9900;color:#111}
@@ -228,7 +231,7 @@ label.chk{display:flex;gap:6px;align-items:center;font-size:14px}
       <div id="nextStop"></div>
       <ol class="stops" id="stopsOut"></ol>
       <div class="tot" id="tot"></div>
-      <div class="note">Stop order is optimised by OSRM’s trip planner from your start point. Up to 20 stops. Tap ✓ when a stop is delivered – your stops stay saved on this phone. Label scans are read on your phone: the photo isn’t uploaded or kept, only the postcode is looked up. District codes (e.g. WS13) route to the district centre; use full postcodes for real drops.</div>
+      <div class="note">Stop order is optimised by OSRM’s trip planner from your start point. Up to 20 stops. Tap ✓ when a stop is delivered – your stops stay saved on this phone. Label scans check the label code (QR, Data Matrix, barcodes) and the printed text, all on your phone: the photo isn’t uploaded or kept, only the postcode is looked up. District codes (e.g. WS13) route to the district centre; use full postcodes for real drops.</div>
     </section>
   </aside>
 </main>
@@ -648,6 +651,14 @@ async function getWorker() {
   await w.setParameters({tessedit_pageseg_mode: "11"});
   return ocrWorker = w;
 }
+const ZX = "https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.6/dist/iife/reader/index.js";
+async function readCodes(file) {
+  try {
+    if (!window.ZXingWASM) await loadScript(ZX);
+    const r = await ZXingWASM.readBarcodes(file, {tryHarder: true, tryRotate: true, tryDownscale: true, maxNumberOfSymbols: 8});
+    return r.filter(x => x.isValid && x.text).map(x => ({format: x.format, text: x.text}));
+  } catch (e) { return []; }
+}
 const loadImg = file => new Promise((res, rej) => { const u = URL.createObjectURL(file), im = new Image();
   im.onload = () => { URL.revokeObjectURL(u); res(im); }; im.onerror = rej; im.src = u; });
 function labelCanvas(img, rot) {
@@ -662,12 +673,13 @@ function labelCanvas(img, rot) {
 }
 /*PC-START*/
 // Turn OCR text into likely UK postcodes, fixing common misreads (0/O, 1/I, 5/S, 8/B) by position.
-function postcodeCandidates(text) {
+function postcodeCandidates(text, ocr = true) {
   const L = {"0": "O", "1": "I", "5": "S", "8": "B", "2": "Z", "6": "G"};
   const D = {"O": "0", "D": "0", "Q": "0", "U": "0", "I": "1", "L": "1", "S": "5", "B": "8", "Z": "2", "G": "6", "T": "7"};
   const toL = ch => L[ch] || ch, toD = ch => D[ch] || ch;
-  const toks = text.toUpperCase().replace(/[)\]}]/g, "J").replace(/[|!]/g, "I").replace(/\$/g, "S").replace(/[€£]/g, "E")
-    .replace(/[^A-Z0-9]+/g, " ").trim().split(" ").filter(Boolean);
+  let up = text.toUpperCase();
+  if (ocr) up = up.replace(/[)\]}]/g, "J").replace(/[|!]/g, "I").replace(/\$/g, "S").replace(/[€£]/g, "E");
+  const toks = up.replace(/[^A-Z0-9]+/g, " ").trim().split(" ").filter(Boolean);
   const raw = [];
   toks.forEach((t, i) => {
     if (t.length >= 2 && t.length <= 4 && toks[i + 1] && toks[i + 1].length === 3) raw.push([t, toks[i + 1]]);
@@ -712,15 +724,21 @@ function addStop(pc) {
   $("#stopsIn").value = (v ? v + "\n" : "") + pc; store.set("vap4.stops", $("#stopsIn").value); return true;
 }
 const scanActs = () => `<div class="scanacts"><button class="btn scan" data-act="again">📷 Scan next</button><button class="btn ghost" data-act="close">Done</button></div>`;
-function showScan(found) {
+function codeInfo(codes, fromCode) {
+  if (!codes) return "";
+  if (!codes.length) return `<div class="codeinfo">No label code (QR / Data Matrix) found on this photo – postcode read from the printed text.</div>`;
+  const kinds = [...new Set(codes.map(c => c.format))].join(", ");
+  return `<details class="codeinfo"><summary>${fromCode ? `Postcode read from the label code (${esc(kinds)})` : `Label code found (${esc(kinds)}) but no postcode inside – read from the printed text instead`}</summary>${codes.map(c => `<code>${esc(c.format)}: ${esc(c.text.slice(0, 400))}</code>`).join("")}</details>`;
+}
+function showScan(found, info = "") {
   const box = $("#scanBox"), n = stopsList().length;
-  if (!found.length) { box.innerHTML = `<span class="err">No postcode found on that photo.</span> Get closer so the address fills the picture, keep it flat and in good light – or type it below.${scanActs()}`; return; }
+  if (!found.length) { box.innerHTML = `<span class="err">No postcode found on that photo.</span> Get closer so the address fills the picture, keep it flat and in good light – or type it below.${info}${scanActs()}`; return; }
   const inA = found.filter(f => f.inArea);
   if (found.length === 1 && inA.length === 1) {
     const f = found[0], added = addStop(f.pc);
-    box.innerHTML = `<span class="okmsg">${added ? "Added" : "Already in your list:"} ${esc(f.pc)}</span> ${esc(f.town)} <span style="color:var(--muted)">· ${nStops()}</span>${scanActs()}`; return;
+    box.innerHTML = `<span class="okmsg">${added ? "Added" : "Already in your list:"} ${esc(f.pc)}</span> ${esc(f.town)} <span style="color:var(--muted)">· ${nStops()}</span>${info}${scanActs()}`; return;
   }
-  box.innerHTML = `Tap the delivery postcode to add it:<div class="pcchips">${found.map(f => `<button class="pcchip${f.inArea ? "" : " out"}" data-pc="${esc(f.pc)}">${esc(f.pc)}<small>${esc(f.town)}${f.inArea ? "" : " – outside your areas"}</small></button>`).join("")}</div>${scanActs()}`;
+  box.innerHTML = `Tap the delivery postcode to add it:<div class="pcchips">${found.map(f => `<button class="pcchip${f.inArea ? "" : " out"}" data-pc="${esc(f.pc)}">${esc(f.pc)}<small>${esc(f.town)}${f.inArea ? "" : " – outside your areas"}</small></button>`).join("")}</div>${info}${scanActs()}`;
 }
 $("#bscan").onclick = () => $("#scanFile").click();
 $("#scanBox").addEventListener("click", e => {
@@ -735,6 +753,14 @@ $("#scanFile").onchange = async e => {
   const box = $("#scanBox");
   box.textContent = ocrWorker ? "Reading label…" : "Getting the label reader ready – the first scan takes a little longer…";
   try {
+    box.textContent = "Checking the label code…";
+    const codes = await readCodes(file);
+    if (codes.length) {
+      const c = postcodeCandidates(codes.map(x => x.text).join("\n"), false);
+      const fromCode = c.length ? await checkPostcodes(c).catch(() => []) : [];
+      if (fromCode.length) { showScan(fromCode, codeInfo(codes, true)); return; }
+    }
+    box.textContent = ocrWorker ? "Reading label…" : "Getting the label reader ready – the first scan takes a little longer…";
     const ready = getWorker().catch(err => { ocrWorker = null; throw err; });
     const [w, img] = await Promise.all([Promise.race([ready, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 60000))]), loadImg(file)]);
     let found = [];
@@ -744,7 +770,7 @@ $("#scanFile").onchange = async e => {
       const c = postcodeCandidates(data.text);
       if (c.length) { found = await checkPostcodes(c); if (found.length) break; }
     }
-    showScan(found);
+    showScan(found, codeInfo(codes, false));
   } catch (err) {
     box.innerHTML = `<span class="err">Couldn’t read the label – check you’re online and try again.</span>${scanActs()}`;
   }
